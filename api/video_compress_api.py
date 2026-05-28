@@ -8,11 +8,15 @@ import re
 import shutil
 import subprocess
 import tempfile
+import mysql.connector
+
+
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(threadName)s] %(name)s: %(message)s"
@@ -20,6 +24,91 @@ DEFAULT_LOG_DIR = "logs"
 DEFAULT_LOG_FILE = "video_compress_api.log"
 LOGGER = logging.getLogger(__name__)
 
+def connect_db(logger_util=None, user="ereish", password="YZ!NL9$tXJBri3", host="192.168.23.200"):
+    """
+    Establishes a connection to the MySQL database.
+
+    Parameters:
+    logger_util (Logger, optional): Logger utility for logging events.
+    user (str, optional): Username for the database connection.
+    password (str, optional): Password for the database connection.
+    host (str, optional): Host address of the database. Defaults to "192.168.23.200" (mysql03).
+
+    Returns:
+    MySQLConnection: A MySQLConnection object representing the database connection.
+    """
+    if(logger_util == None):
+        print("Connecting to database...")
+    else:
+        logger_util.log_event("Connecting to database...")
+    db = mysql.connector.connect(
+        host=host,
+        user=user,
+        password=password,
+        connection_timeout=None,
+    )
+    #db.start_transaction(isolation_level='READ COMMITTED')
+    if(logger_util == None):
+        print("connected to database")
+    else:
+        logger_util.log_event("connected to database")
+    return db
+
+
+def compressed_mms_link(original_mms_link: str) -> str:
+    """Return the MMS link for the compressed version of the original video."""
+    original_mms_link = original_mms_link.strip()
+    if not original_mms_link:
+        raise ValueError("Original MMS link is empty")
+
+    parsed = urlsplit(original_mms_link)
+    path = PurePosixPath(parsed.path)
+    if not path.name:
+        raise ValueError(f"Original MMS link does not include a filename: {original_mms_link}")
+
+    suffix = path.suffix or ".mp4"
+    compressed_path = path.with_name(f"{path.stem}-compressed{suffix}")
+    return urlunsplit(parsed._replace(path=str(compressed_path)))
+
+
+def update_pollquestion_mms(questionid: str, logger: Optional[logging.Logger] = None) -> str:
+    """Update human.pollquestions.mms to point at the compressed video."""
+    questionid = str(questionid).strip()
+    if not questionid:
+        raise ValueError("pollquestionid is empty")
+
+    db = None
+    cursor = None
+    try:
+        db = connect_db()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT mms AS mms FROM human.pollquestions WHERE questionid = %s",
+            (questionid,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise ValueError(f"No human.pollquestions record found for questionid {questionid}")
+
+        original_mms = row.get("mms")
+        if not original_mms:
+            raise ValueError(f"human.pollquestions.mms is empty for questionid {questionid}")
+
+        new_mms = compressed_mms_link(str(original_mms))
+        cursor.execute(
+            "UPDATE human.pollquestions SET mms = %s WHERE questionid = %s LIMIT 1",
+            (new_mms, questionid),
+        )
+        db.commit()
+
+        if logger:
+            logger.info("Updated human.pollquestions.mms for questionid %s: %s", questionid, new_mms)
+        return new_mms
+    finally:
+        if cursor:
+            cursor.close()
+        if db:
+            db.close()
 
 @dataclass
 class VideoInfo:
@@ -69,6 +158,13 @@ class RabbitMQConfig:
             requeue_on_failure=os.getenv("RABBITMQ_REQUEUE_ON_FAILURE", "false").lower()
             in {"1", "true", "yes"},
         )
+
+
+@dataclass
+class CompressionRequest:
+    """One video compression request from RabbitMQ."""
+    file_name: str
+    pollquestionid: Optional[str] = None
 
 
 class VideoCompressor:
@@ -622,8 +718,8 @@ class RabbitMQVideoCompressionAPI:
         self.channel = None
 
     @staticmethod
-    def parse_file_name_message(body: bytes) -> str:
-        """Parse a RabbitMQ message body into an input filename."""
+    def parse_compression_request_message(body: bytes) -> CompressionRequest:
+        """Parse a RabbitMQ message body into a compression request."""
         text = body.decode("utf-8").strip()
         if not text:
             raise ValueError("Message body is empty")
@@ -631,10 +727,11 @@ class RabbitMQVideoCompressionAPI:
         try:
             payload = json.loads(text)
         except json.JSONDecodeError:
-            return text
+            return CompressionRequest(file_name=text)
 
         if isinstance(payload, str):
             file_name = payload
+            pollquestionid = None
         elif isinstance(payload, dict):
             file_name = (
                 payload.get("file_name")
@@ -642,15 +739,25 @@ class RabbitMQVideoCompressionAPI:
                 or payload.get("file")
                 or payload.get("path")
             )
+            pollquestionid = payload.get("pollquestionid")
         else:
             file_name = None
+            pollquestionid = None
 
         if not file_name:
             raise ValueError(
                 "Message must be a filename string or JSON with file_name, filename, file, or path"
             )
 
-        return str(file_name).strip()
+        return CompressionRequest(
+            file_name=str(file_name).strip(),
+            pollquestionid=None if pollquestionid is None else str(pollquestionid).strip(),
+        )
+
+    @staticmethod
+    def parse_file_name_message(body: bytes) -> str:
+        """Parse a RabbitMQ message body into an input filename."""
+        return RabbitMQVideoCompressionAPI.parse_compression_request_message(body).file_name
 
     def connect(self):
         """Open a RabbitMQ connection and channel."""
@@ -678,10 +785,13 @@ class RabbitMQVideoCompressionAPI:
     def process_message(self, channel, delivery_tag: int, body: bytes) -> None:
         """Compress one RabbitMQ message in a worker thread."""
         try:
-            input_file = self.parse_file_name_message(body)
+            request = self.parse_compression_request_message(body)
+            input_file = request.file_name
             output_file = self.compressor.compressed_output_path(input_file)
 
             self.logger.info("Received compression request: %s", input_file)
+            if request.pollquestionid is not None:
+                self.logger.info("Poll question ID: %s", request.pollquestionid)
             self.logger.info("Output file: %s", output_file)
 
             self.compressor.compress_file(
@@ -691,6 +801,12 @@ class RabbitMQVideoCompressionAPI:
                 fps=VideoCompressor.DEFAULT_FPS,
                 audio_bitrate_kbps=VideoCompressor.DEFAULT_AUDIO_BITRATE_KBPS,
             )
+
+            if request.pollquestionid:
+                new_mms = update_pollquestion_mms(request.pollquestionid, self.logger)
+                self.logger.info("Compressed MMS link: %s", new_mms)
+            else:
+                self.logger.info("No pollquestionid supplied; skipping MMS SQL update.")
 
             self.ack_message(channel, delivery_tag)
             self.logger.info("Compression finished: %s", output_file)
@@ -742,7 +858,7 @@ class RabbitMQVideoCompressionAPI:
 
         self.logger.info("Waiting for video compression messages on queue: %s", self.config.queue_name)
         self.logger.info("Max concurrent compression jobs: %s", self.config.max_concurrent_jobs)
-        self.logger.info("Messages may be plain filenames or JSON with a file_name field.")
+        self.logger.info("Messages may be plain filenames or JSON with file_name and pollquestionid fields.")
 
         try:
             channel.start_consuming()
