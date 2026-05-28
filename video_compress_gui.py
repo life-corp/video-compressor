@@ -635,9 +635,9 @@ class VideoCompressorGUI:
         self.output_folder = tk.StringVar()
         self.output_filename = tk.StringVar(value="compressed_video.mp4")
         self.target_size = tk.StringVar(value="640")
-        self.fps = tk.StringVar(value="20")
+        self.fps = tk.StringVar(value="24")
         self.format_choice = tk.StringVar(value="HEVC (CPU)")
-        self.audio_bitrate = tk.StringVar(value="16")
+        self.audio_bitrate = tk.StringVar(value="32")
         self.single_pass = tk.BooleanVar(value=False)
         self.invert_aspect = tk.BooleanVar(value=False)
         
@@ -866,6 +866,10 @@ class VideoCompressorGUI:
     def run_compression(self):
         """Run the compression"""
         try:
+            
+            ########################################################################
+            # ACTUAL VIDEO COMPRESSION
+            #
             # Build output path
             output_path = os.path.join(self.output_folder.get(), self.output_filename.get())
             
@@ -892,7 +896,9 @@ class VideoCompressorGUI:
                 self.log_output(f"\n{'=' * 80}\n")
                 self.log_output("✗ Compression failed!\n")
                 messagebox.showerror("Error", "Video compression failed. Check the log for details.")
-        
+    
+            #########################################################################
+
         except Exception as e:
             self.log_output(f"\nError: {str(e)}\n")
             messagebox.showerror("Error", f"An error occurred: {str(e)}")
