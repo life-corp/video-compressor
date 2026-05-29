@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import mysql.connector
-
+import shutil
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -409,6 +409,7 @@ class VideoCompressor:
                 "-i", input_file,
                 "-vf", vf_string,
                 "-c:v", "libx265",
+                "-threads", "16",
                 "-preset", "slow",
                 "-profile:v", "main",
                 "-pix_fmt", "yuv420p",
@@ -501,9 +502,12 @@ class VideoCompressor:
     def compressed_output_path(input_file: str) -> str:
         """Return the default compressed output path for an input file."""
         input_path = Path(input_file)
-        if input_path.suffix:
-            return str(input_path.with_name(f"{input_path.stem}-compressed{input_path.suffix}"))
-        return str(input_path.with_name(f"{input_path.name}-compressed"))
+        if('-compressed' in input_path.stem):
+            return str(input_path)
+        else:
+            if input_path.suffix:
+                return str(input_path.with_name(f"{input_path.stem}-compressed{input_path.suffix}"))
+            return str(input_path.with_name(f"{input_path.name}-compressed"))
 
     def compress_file(
         self,
@@ -801,6 +805,9 @@ class RabbitMQVideoCompressionAPI:
                 fps=VideoCompressor.DEFAULT_FPS,
                 audio_bitrate_kbps=VideoCompressor.DEFAULT_AUDIO_BITRATE_KBPS,
             )
+            
+            # copy the output file to web 7 as well
+            shutil.copy2(output_file, output_file.replace("/web5/", "/web7/"))
 
             if request.pollquestionid:
                 new_mms = update_pollquestion_mms(request.pollquestionid, self.logger)
