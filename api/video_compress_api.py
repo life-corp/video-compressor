@@ -71,7 +71,7 @@ def compressed_mms_link(original_mms_link: str) -> str:
     return urlunsplit(parsed._replace(path=str(compressed_path)))
 
 
-def update_pollquestion_mms(questionid: str, logger: Optional[logging.Logger] = None) -> str:
+def update_pollquestion_mms(questionid: str, filename: str, logger: Optional[logging.Logger] = None) -> str:
     """Update human.pollquestions.mms to point at the compressed video."""
     questionid = str(questionid).strip()
     if not questionid:
@@ -95,14 +95,17 @@ def update_pollquestion_mms(questionid: str, logger: Optional[logging.Logger] = 
             raise ValueError(f"human.pollquestions.mms is empty for questionid {questionid}")
 
         new_mms = compressed_mms_link(str(original_mms))
+        
+        # Remove filepath from filename for the SQL LIKE match
+        filename = os.path.basename(filename)
         cursor.execute(
-            "UPDATE human.pollquestions SET mms = %s WHERE questionid = %s LIMIT 1",
-            (new_mms, questionid),
+            "UPDATE human.pollquestions SET mms = %s WHERE questionid = %s AND mms LIKE %s LIMIT 1",
+            (new_mms, questionid, f"%{filename}%")
         )
         db.commit()
 
         if logger:
-            logger.info("Updated human.pollquestions.mms for questionid %s: %s", questionid, new_mms)
+            logger.info("Ran update for human.pollquestions.mms for questionid %s: %s", questionid, new_mms)
         return new_mms
     finally:
         if cursor:
@@ -377,7 +380,7 @@ class VideoCompressor:
         fps: float,
         video_bitrate_kbps: int,
         audio_bitrate_kbps: int = 16,
-        two_pass: bool = True,
+        two_pass: bool = False,
         target_bytes: Optional[int] = None,
         size_tolerance: float = 0.05,
     ) -> bool:
@@ -409,8 +412,7 @@ class VideoCompressor:
                 "-i", input_file,
                 "-vf", vf_string,
                 "-c:v", "libx265",
-                "-threads", "16",
-                "-preset", "slow",
+                "-preset", "medium",
                 "-profile:v", "main",
                 "-pix_fmt", "yuv420p",
                 "-tag:v", "hvc1",
@@ -516,7 +518,7 @@ class VideoCompressor:
         target_size_kb: float = DEFAULT_TARGET_SIZE_KB,
         fps: float = DEFAULT_FPS,
         audio_bitrate_kbps: int = DEFAULT_AUDIO_BITRATE_KBPS,
-        two_pass: bool = True,
+        two_pass: bool = False,
         invert_aspect_ratio: bool = False,
     ) -> str:
         """Compress one input file and return the output path."""
@@ -621,7 +623,7 @@ def encode_video(
     fps: float,
     video_bitrate_kbps: int,
     audio_bitrate_kbps: int = 16,
-    two_pass: bool = True,
+    two_pass: bool = False,
     target_bytes: Optional[int] = None,
     size_tolerance: float = 0.05,
 ) -> bool:
@@ -656,7 +658,7 @@ def compress_file(
     target_size_kb: float = VideoCompressor.DEFAULT_TARGET_SIZE_KB,
     fps: float = VideoCompressor.DEFAULT_FPS,
     audio_bitrate_kbps: int = VideoCompressor.DEFAULT_AUDIO_BITRATE_KBPS,
-    two_pass: bool = True,
+    two_pass: bool = False,
     invert_aspect_ratio: bool = False,
 ) -> str:
     """Compress one input file and return the output path."""
@@ -810,7 +812,7 @@ class RabbitMQVideoCompressionAPI:
             shutil.copy2(output_file, output_file.replace("/web5/", "/web7/"))
 
             if request.pollquestionid:
-                new_mms = update_pollquestion_mms(request.pollquestionid, self.logger)
+                new_mms = update_pollquestion_mms(request.pollquestionid, request.file_name, self.logger)
                 self.logger.info("Compressed MMS link: %s", new_mms)
             else:
                 self.logger.info("No pollquestionid supplied; skipping MMS SQL update.")
